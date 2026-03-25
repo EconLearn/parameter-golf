@@ -1,0 +1,21 @@
+{
+    "name": "V3_FixedTTT_XSAall_OGDbias",
+    "date": "2026-03-23",
+    "base": "2026-03-22_11L_EMA_GPTQ-lite_warmdown3500_QAT015_1.1233",
+    "track": "10min_16mb",
+    "changes": [
+        "Fixed LoRA TTT autograd (monkey-patch forward, not .data assignment)",
+        "XSA on all 11 layers (was last 4)",
+        "LeakyReLU(0.5)^2 activation",
+        "Online Gradient Descent vocab bias",
+        "Temperature calibration T=0.98",
+        "XSA disabled during TTT"
+    ],
+    "results": {
+        "val_bpb": 0.0,
+        "val_loss": 0.0,
+        "ttt_val_bpb": 0.0,
+        "sliding_val_bpb": 0.0
+    },
+    "notes": "Results to be filled after training run"
+}
