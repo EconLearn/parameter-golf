@@ -948,21 +948,22 @@ def selective_prune_to_fit(quant_result, quant_meta, code_bytes, target_bytes=15
         if not mask.any(): continue
         rows, cols = mask.nonzero(as_tuple=True)
         errs = s[rows].float().pow(2) if s.ndim > 0 else s.float().pow(2).expand(len(rows))
-        for r, c, e in zip(rows.tolist(), cols.tolist(), errs.tolist()):
-            ones_info.append((name + ".q", r, c, e))
+        vals = q[rows, cols].tolist()
+        for r, c, e, v in zip(rows.tolist(), cols.tolist(), errs.tolist(), vals):
+            ones_info.append((name + ".q", r, c, e, v))
     if not ones_info: return
     ones_info.sort(key=lambda x: x[3])
     def _try_prune(n):
         for i in range(n):
-            tn, r, c, _ = ones_info[i]
+            tn, r, c, _, _ = ones_info[i]
             quant_result[tn][r, c] = 0
         buf = io.BytesIO()
         torch.save({"w": quant_result, "m": quant_meta}, buf)
         raw = buf.getvalue()
         blob = zstandard.ZstdCompressor(level=22).compress(raw) if _COMPRESSOR == "zstd" else zlib.compress(raw, 9)
-        for i in range(n):  # restore
-            tn, r, c, _ = ones_info[i]
-            quant_result[tn][r, c] = 1 if ones_info[i][3] > 0 else -1
+        for i in range(n):  # restore original values
+            tn, r, c, _, v = ones_info[i]
+            quant_result[tn][r, c] = v
         return len(blob) + code_bytes
     lo, hi = 0, len(ones_info)
     while lo < hi:
@@ -972,7 +973,7 @@ def selective_prune_to_fit(quant_result, quant_meta, code_bytes, target_bytes=15
         else:
             lo = mid + 1
     for i in range(lo):
-        tn, r, c, _ = ones_info[i]
+        tn, r, c, _, _ = ones_info[i]
         quant_result[tn][r, c] = 0
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hessians: dict[str, Tensor] | None = None):
     num_layers_total = max(
@@ -1402,8 +1403,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     # Collect Hessians for Full GPTQ (PR #609)
-    log0("gptq:collecting Hessians for full GPTQ quantization...")
-    hessian_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    log0("gptq:collecting Hessians..."); hessian_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     hessians = collect_hessians(base_model, hessian_loader, device, num_batches=64, seq_len=args.train_seq_len)
     log0(f"gptq:collected {len(hessians)} Hessians")
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"}, hessians=hessians)
