@@ -1037,12 +1037,12 @@ def collect_hessians(model, train_loader, device, num_batches=64, seq_len=2048):
     for nm, mod in model.named_modules():
         if isinstance(mod, CastedLinear) and mod.weight.numel() > 65536: hooks.append(mod.register_forward_hook(make_hook(nm + ".weight")))
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for _ in range(num_batches):
             x, y = train_loader.next_batch(seq_len * 8, seq_len, 1)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16): model(x, y)
     for h in hooks: h.remove()
-    for k in hessians: hessians[k] /= num_batches
+    for k in hessians: hessians[k] = hessians[k] / num_batches
     return hessians
 def main() -> None:
     global zeropower_via_newtonschulz5
