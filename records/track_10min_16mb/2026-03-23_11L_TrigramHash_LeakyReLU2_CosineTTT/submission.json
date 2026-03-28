@@ -1,0 +1,26 @@
+{
+  "val_bpb_mean": 0.0,
+  "val_bpb_seeds": [0.0, 0.0, 0.0],
+  "artifact_bytes": 0,
+  "training_time_minutes": 0,
+  "techniques": [
+    "trigram_hash_4096",
+    "leaky_relu_sq_0.5",
+    "xsa4",
+    "value_residual",
+    "ema_0.997",
+    "swa_50",
+    "late_qat_0.15",
+    "gptq_lite_5pct",
+    "int6_zstd22",
+    "cosine_ttt_lora8",
+    "orthoinit",
+    "smeargate",
+    "partial_rope16",
+    "ln_scale",
+    "unet_skip",
+    "gqa_4kv",
+    "flash_attn3"
+  ],
+  "baseline_reference": "PR_414"
+}
