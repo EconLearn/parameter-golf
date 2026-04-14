@@ -16,6 +16,11 @@ try:
     _COMPRESSOR = "zstd"
 except ImportError:
     _COMPRESSOR = "zlib"
+try:
+    import brotli
+    _HAS_BROTLI = True
+except ImportError:
+    _HAS_BROTLI = False
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -246,27 +251,27 @@ def decode_weights(blob):
 # Hyperparameters
 # ---------------------------------------------------------------------------
 class Hyperparameters:
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 5000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    model_dim = int(os.environ.get("MODEL_DIM", 640))
-    num_heads = int(os.environ.get("NUM_HEADS", 10))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -275,9 +280,9 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.03))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.97))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
@@ -291,8 +296,8 @@ class Hyperparameters:
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
-    muon_wd = float(os.environ.get("MUON_WD", 0.04))
-    adam_wd = float(os.environ.get("ADAM_WD", 0.04))
+    muon_wd = float(os.environ.get("MUON_WD", 0.095))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.095))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -303,9 +308,9 @@ class Hyperparameters:
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.25))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
-    ve_layers_str = os.environ.get("VE_LAYERS", "8,9")
+    ve_layers_str = os.environ.get("VE_LAYERS", "12,13")
     # --- Recursive architecture ---
-    num_base_layers = int(os.environ.get("NUM_BASE_LAYERS", 5))
+    num_base_layers = int(os.environ.get("NUM_BASE_LAYERS", 7))
     loop_count = int(os.environ.get("LOOP_COUNT", 2))
     lora_rank = int(os.environ.get("LORA_RANK", 8))
     lora_lr = float(os.environ.get("LORA_LR", 0.06))
@@ -320,6 +325,9 @@ class Hyperparameters:
     ngram_eval_enabled = bool(int(os.environ.get("NGRAM_EVAL_ENABLED", "1")))
     ngram_eval_weight = float(os.environ.get("NGRAM_EVAL_WEIGHT", 0.3))
     self_distill_weight = float(os.environ.get("SELF_DISTILL_WEIGHT", 0.1))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+    sdclip_k_int6 = float(os.environ.get("SDCLIP_K_INT6", 12.85))
+    sdclip_k_int8 = float(os.environ.get("SDCLIP_K_INT8", 20.0))
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -438,17 +446,19 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_Q = 0.9999984
-def quantize_float_tensor(t):
+def quantize_float_tensor(t, sdclip_k=20.0):
+    """Int8 per-row quantization with SDClip: clip at k * row_std."""
     t32 = t.float()
     if t32.ndim == 2:
-        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
+        row_std = t32.std(dim=1)
+        clip_abs = (sdclip_k * row_std).clamp_min(1e-8)
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    amax = t32.abs().max().item()
+    scale = torch.tensor(amax / 127.0 if amax > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -amax, amax) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 def load_data_shard(file):
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -1009,23 +1019,21 @@ def _classify_param(name):
     if ".mlp." in name: return "mlp"
     if ".attn." in name or (".proj." in name and ".mlp." not in name): return "attn"
     return "other"
-def quantize_int6_per_row(t, clip_range=31):
+def quantize_int6_per_row(t, clip_range=31, sdclip_k=12.85):
+    """Int6 per-row quantization with SDClip: clip at k * row_std."""
     t32 = t.float()
     if t32.ndim == 2:
-        best_q, best_s, best_err = None, None, float('inf')
-        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
-            if pct < 1.0: row_clip = torch.quantile(t32.abs(), pct, dim=1)
-            else: row_clip = t32.abs().amax(dim=1)
-            s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
-            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
-            recon = q.float() * s.float()[:, None]; err = (t32 - recon).pow(2).mean().item()
-            if err < best_err: best_q, best_s, best_err = q, s, err
-        return best_q, best_s
+        row_std = t32.std(dim=1)
+        row_clip = (sdclip_k * row_std).clamp_min(1e-8)
+        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+        q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
+        return q, s
     amax = t32.abs().max().item()
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
-def quantize_int6_gptq(weight, hessian, clip_range=31, block_size=128):
+def quantize_int6_gptq(weight, hessian, clip_range=31, block_size=128, sdclip_k=12.85):
+    """Full Hessian GPTQ with SDClip: k * sigma per-row clip range."""
     W = weight.float().clone(); nrow, ncol = W.shape
     perm = torch.argsort(torch.diag(hessian), descending=True)
     W = W[:, perm]; H = hessian[perm][:, perm]
@@ -1033,25 +1041,23 @@ def quantize_int6_gptq(weight, hessian, clip_range=31, block_size=128):
     try:
         Hinv_chol = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True).float()
     except Exception:
-        return quantize_int6_per_row(weight)
-    best_q, best_s, best_err = None, None, float('inf')
-    for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
-        Wt = W.clone()
-        row_clip = torch.quantile(Wt.abs(), pct, dim=1) if pct < 1.0 else Wt.abs().amax(dim=1)
-        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
-        Qt = torch.zeros_like(Wt, dtype=torch.int8)
-        for b_start in range(0, ncol, block_size):
-            b_end = min(b_start + block_size, ncol)
-            W1, H1 = Wt[:, b_start:b_end].clone(), Hinv_chol[b_start:b_end, b_start:b_end]
-            for i in range(b_end - b_start):
-                w_col = W1[:, i]; q_col = torch.clamp(torch.round(w_col / s.float()), -clip_range, clip_range)
-                Qt[:, b_start + i] = q_col.to(torch.int8)
-                err = (w_col - q_col * s.float()) / H1[i, i]
-                W1[:, i:] -= err.unsqueeze(1) * H1[i, i:].unsqueeze(0)
-            Wt[:, b_end:] -= (Wt[:, b_start:b_end] - Qt[:, b_start:b_end].float() * s.float().unsqueeze(1)) @ Hinv_chol[b_start:b_end, b_end:]
-        mse = (W - Qt.float() * s.float().unsqueeze(1)).pow(2).mean().item()
-        if mse < best_err: best_q, best_s, best_err = Qt, s, mse
-    return best_q[:, torch.argsort(perm)].contiguous(), best_s
+        return quantize_int6_per_row(weight, clip_range=clip_range, sdclip_k=sdclip_k)
+    # SDClip: single k*sigma clip range (no percentile sweep needed)
+    row_std = W.std(dim=1)
+    row_clip = (sdclip_k * row_std).clamp_min(1e-8)
+    s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+    Qt = torch.zeros_like(W, dtype=torch.int8)
+    Wt = W.clone()
+    for b_start in range(0, ncol, block_size):
+        b_end = min(b_start + block_size, ncol)
+        W1, H1 = Wt[:, b_start:b_end].clone(), Hinv_chol[b_start:b_end, b_start:b_end]
+        for i in range(b_end - b_start):
+            w_col = W1[:, i]; q_col = torch.clamp(torch.round(w_col / s.float()), -clip_range, clip_range)
+            Qt[:, b_start + i] = q_col.to(torch.int8)
+            err = (w_col - q_col * s.float()) / H1[i, i]
+            W1[:, i:] -= err.unsqueeze(1) * H1[i, i:].unsqueeze(0)
+        Wt[:, b_end:] -= (Wt[:, b_start:b_end] - Qt[:, b_start:b_end].float() * s.float().unsqueeze(1)) @ Hinv_chol[b_start:b_end, b_end:]
+    return Qt[:, torch.argsort(perm)].contiguous(), s
 def selective_prune_to_fit(quant_result, quant_meta, code_bytes, target_bytes=15_900_000, use_huffman=True):
     ones_info = []
     for name, info in quant_meta.items():
@@ -1484,7 +1490,7 @@ def main():
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state, swa_count = None, 0
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
-    ema_decay = 0.997
+    ema_decay = args.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
     entropy_reg_active = False
@@ -1598,24 +1604,29 @@ def main():
     # Encode with Huffman
     log0("huffman:encoding weights...")
     huff_blob = encode_weights(quant_result, quant_meta)
-    # Also produce zstd for comparison
+    # Also produce zstd/zlib for comparison
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     zstd_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, 9)
+    # Brotli-11 compression (best ratio for neural weight data)
+    brotli_blob = brotli.compress(quant_raw, quality=11) if _HAS_BROTLI else None
     if master_process:
         with open("final_model.huff", "wb") as f: f.write(huff_blob)
         with open("final_model.int6.ptz", "wb") as f: f.write(zstd_blob)
         log0(f"Huffman blob: {len(huff_blob)} bytes (total: {len(huff_blob) + code_bytes})")
         log0(f"zstd blob: {len(zstd_blob)} bytes (total: {len(zstd_blob) + code_bytes})")
-        # Use whichever is smaller
-        if len(huff_blob) < len(zstd_blob):
-            log0("WINNER: Huffman encoding")
-            final_blob = huff_blob; final_ext = "huff"
-        else:
-            log0("WINNER: zstd encoding")
-            final_blob = zstd_blob; final_ext = "ptz"
-        log0(f"Final submission size: {len(final_blob) + code_bytes} bytes")
+        if brotli_blob is not None:
+            with open("final_model.brotli", "wb") as f: f.write(brotli_blob)
+            log0(f"Brotli blob: {len(brotli_blob)} bytes (total: {len(brotli_blob) + code_bytes})")
+        # Pick smallest compression
+        candidates = [("huffman", huff_blob, len(huff_blob)), ("zstd", zstd_blob, len(zstd_blob))]
+        if brotli_blob is not None:
+            candidates.append(("brotli", brotli_blob, len(brotli_blob)))
+        best_name, final_blob, best_size = min(candidates, key=lambda x: x[2])
+        final_ext = {"huffman": "huff", "zstd": "ptz", "brotli": "brotli"}[best_name]
+        log0(f"WINNER: {best_name} encoding ({best_size} bytes)")
+        log0(f"Final submission size: {best_size + code_bytes} bytes")
     if distributed: dist.barrier()
     # Roundtrip eval from Huffman blob
     with open("final_model.huff", "rb") as f: huff_disk = f.read()
