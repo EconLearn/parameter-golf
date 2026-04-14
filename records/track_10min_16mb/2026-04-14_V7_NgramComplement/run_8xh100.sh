@@ -19,12 +19,12 @@ fi
 cd parameter-golf && git pull
 pip install zstandard
 
-# Download SP8192 data (the key tokenizer upgrade)
-if [ ! -f "data/datasets/fineweb10B_sp8192/fineweb_val_000000.bin" ]; then
-    echo ">>> Downloading SP8192 data..."
-    python3 data/cached_challenge_fineweb.py --variant sp8192
+# Download SP1024 data
+if [ ! -f "data/datasets/fineweb10B_sp1024/fineweb_val_000000.bin" ]; then
+    echo ">>> Downloading SP1024 data..."
+    python3 data/cached_challenge_fineweb.py --variant sp1024
 else
-    echo ">>> SP8192 data already present"
+    echo ">>> SP1024 data already present"
 fi
 
 echo ">>> GPU check:"
@@ -34,16 +34,16 @@ SCRIPT="records/track_10min_16mb/2026-04-14_V7_NgramComplement/train_gpt.py"
 LOGDIR="records/track_10min_16mb/2026-04-14_V7_NgramComplement/logs"
 mkdir -p "$LOGDIR"
 
-# V7 config: SP8192, dim=512, 5x2 recursive, n-gram complement
-export VOCAB_SIZE=8192
-export DATA_PATH=./data/datasets/fineweb10B_sp8192
-export TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model
+# V7 config: SP1024, dim=640, 5x2 recursive, n-gram complement
+export VOCAB_SIZE=1024
+export DATA_PATH=./data/datasets/fineweb10B_sp1024
+export TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model
 export NUM_BASE_LAYERS=5
 export LOOP_COUNT=2
 export LORA_RANK=8
-export MODEL_DIM=512
-export NUM_HEADS=8
-export NUM_KV_HEADS=4
+export MODEL_DIM=640
+export NUM_HEADS=10
+export NUM_KV_HEADS=5
 export XSA_LAST_N=4
 export OGD_BIAS_ENABLED=1
 export ENTROPY_REG_LAMBDA=0.03
