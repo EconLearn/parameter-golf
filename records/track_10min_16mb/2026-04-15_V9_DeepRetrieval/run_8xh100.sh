@@ -40,13 +40,24 @@ cd parameter-golf && git pull
 echo ">>> Installing dependencies..."
 pip install sentencepiece huggingface_hub zstandard brotli 2>&1 | tail -5
 
-# --- Install flash_attn_3 (CRITICAL) ---
-# The V7 run crashed to 590ms/step because flash_attn_3 was missing and the
-# fallback uses F.scaled_dot_product_attention (3-5x slower on H100s).
-# On an H100 pod with the standard PyTorch 2.4 wheel, this builds in ~3 min.
+# --- Install flash_attn v3 (hopper kernels, CRITICAL for H100) ---
+# The PyPI "flash-attn" package is v2 (exposes flash_attn.flash_attn_func).
+# V3 Hopper kernels live in the hopper/ subdirectory of the source repo and
+# must be built from source. V9 run 1 missed this and fell back to SDPA at
+# 152ms/step vs the 86ms/step target — losing ~45% of training steps.
+#
+# Strategy: build hopper kernels from source (takes ~5-8 min). If the build
+# fails (no nvcc, wrong CUDA version, etc.) we keep going with the SDPA fallback.
 if ! python3 -c "import flash_attn_interface" 2>/dev/null; then
-    echo ">>> Installing flash_attn_3 (needed for fast attention on H100)..."
-    pip install flash-attn --no-build-isolation 2>&1 | tail -5 || echo ">>> flash-attn pip install failed, will use SDPA fallback"
+    echo ">>> Building flash_attn v3 hopper kernels from source (5-8 min)..."
+    pip install ninja packaging 2>&1 | tail -3
+    TMPDIR=$(mktemp -d)
+    (
+      cd "$TMPDIR" \
+      && git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git \
+      && cd flash-attention/hopper \
+      && MAX_JOBS=4 python3 setup.py install
+    ) 2>&1 | tail -15 || echo ">>> flash_attn v3 build failed — falling back to SDPA (expect ~152ms/step)"
 fi
 
 # Verify critical imports BEFORE spending time/money on data download
@@ -89,10 +100,13 @@ SCRIPT="records/track_10min_16mb/2026-04-15_V9_DeepRetrieval/train_gpt.py"
 LOGDIR="records/track_10min_16mb/2026-04-15_V9_DeepRetrieval/logs"
 mkdir -p "$LOGDIR"
 
-# --- V9 Config: 11L DENSE + SP8192 + bigbag 1.0810 hyperparams ---
-# These are the exposed knobs; defaults inside train_gpt.py already match this,
-# but setting them explicitly here makes the run reproducible if train_gpt.py
-# defaults drift later.
+# --- V9.1 Config: 11L DENSE + SP8192 + proven 1.1228 SOTA hyperparams ---
+# V9 run 1 used bigbag 1.0810 hparams (QK=5.25, LR=0.03, WD=0.095, EMA=0.9965,
+# warmdown=5000, late QAT=0.25). On this 11L dense arch those hparams produced
+# catastrophic train/val divergence: step 500 train_loss=3.36 vs SOTA 2.40,
+# step 3947 val_loss=7.76 while train_loss=3.05 (4.7 nat gap). Unusable.
+# V9.1 reverts to the 1.1228 SOTA hparams, keeps SP8192 + compression + eval.
+#
 # Tokenizer & data
 export VOCAB_SIZE=8192
 export DATA_PATH=./data/datasets/fineweb10B_sp8192
@@ -107,16 +121,16 @@ export MLP_MULT=3.0
 export XSA_LAST_N=4
 export VE_LAYERS="9,10"
 
-# bigbag 1.0810 hyperparameters
-export QK_GAIN_INIT=5.25
-export MATRIX_LR=0.03
-export MUON_MOMENTUM=0.97
-export MUON_WD=0.095
-export ADAM_WD=0.095
-export EMA_DECAY=0.9965
-export WARMDOWN_ITERS=5000
-export LATE_QAT_THRESHOLD=0.25
-export BIGRAM_VOCAB_SIZE=4096
+# SOTA 1.1228 hyperparameters (proven stable on this 11L dense arch)
+export QK_GAIN_INIT=1.5
+export MATRIX_LR=0.025
+export MUON_MOMENTUM=0.99
+export MUON_WD=0.04
+export ADAM_WD=0.04
+export EMA_DECAY=0.997
+export WARMDOWN_ITERS=3500
+export LATE_QAT_THRESHOLD=0.15
+export BIGRAM_VOCAB_SIZE=2048
 
 # V9 compression pipeline
 export SDCLIP_K_INT6=12.85
