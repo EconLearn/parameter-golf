@@ -116,8 +116,19 @@ export NGRAM_EVAL_ENABLED=1
 export NGRAM_EVAL_WEIGHT=0.3
 export SELF_DISTILL_WEIGHT=0.1
 
-# OGD bias at eval time
+# OGD bias at eval time (with Nacrith-style beta decay + recency weighting)
 export OGD_BIAS_ENABLED=1
+export OGD_BIAS_PER_TOKEN=1
+export OGD_BIAS_BETA=0.995
+
+# Legal Score-First TTT with entropy gating (V9 novel technique)
+# SGD on matrix params only where neural entropy is in top 50%
+export TTT_ENABLED=1
+export TTT_LR=0.005
+export TTT_MOMENTUM=0.9
+export TTT_EPOCHS=3
+export TTT_ENTROPY_GATE=1
+export TTT_ENTROPY_QUANTILE=0.5
 
 if [ "$MODE" = "all" ]; then
     SEEDS="1337 42 2024"
@@ -137,6 +148,7 @@ for SEED in $SEEDS; do
     echo ">>> SEED $SEED - Finished at $(date)"
     grep "final_int8_zlib_roundtrip_exact" "$LOGDIR/train_seed${SEED}.log" | tail -1 || echo "Score not found"
     grep "final_ngram_oracle_exact" "$LOGDIR/train_seed${SEED}.log" | tail -1 || echo "N-gram score not found"
+    grep "final_ttt_exact" "$LOGDIR/train_seed${SEED}.log" | tail -1 || echo "TTT score not found"
 done
 
 END=$(date +%s); ELAPSED=$((END - START))
@@ -146,7 +158,7 @@ echo "RUN COMPLETE - ${ELAPSED}s ($((ELAPSED/60))m)"
 echo "=== RESULTS ==="
 for SEED in $SEEDS; do
     echo "--- Seed $SEED ---"
-    grep "final_int6_sliding_window_exact\|final_ogd\|final_ngram_oracle_exact\|final_int8_zlib_roundtrip_exact\|WINNER\|Final submission size" "$LOGDIR/train_seed${SEED}.log" | tail -6
+    grep "final_int6_sliding_window_exact\|final_ogd\|final_ngram_oracle_exact\|final_ttt_exact\|final_int8_zlib_roundtrip_exact\|WINNER\|Final submission size" "$LOGDIR/train_seed${SEED}.log" | tail -8
 done
 echo ""
 echo "Logs: $LOGDIR/"

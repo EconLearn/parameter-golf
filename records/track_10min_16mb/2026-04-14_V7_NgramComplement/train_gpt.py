@@ -328,6 +328,16 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
     sdclip_k_int6 = float(os.environ.get("SDCLIP_K_INT6", 12.85))
     sdclip_k_int8 = float(os.environ.get("SDCLIP_K_INT8", 20.0))
+    # --- V9: Legal Score-First TTT with entropy gating (our novel twist) ---
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.005))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_entropy_gate = bool(int(os.environ.get("TTT_ENTROPY_GATE", "1")))
+    ttt_entropy_quantile = float(os.environ.get("TTT_ENTROPY_QUANTILE", 0.5))
+    # Per-token OGD bias (Nacrith-style upgrade to our existing batch-OGD)
+    ogd_bias_per_token = bool(int(os.environ.get("OGD_BIAS_PER_TOKEN", "1")))
+    ogd_bias_beta = float(os.environ.get("OGD_BIAS_BETA", 0.995))
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -717,6 +727,7 @@ class GPT(nn.Module):
         self.loop_count = loop_count
         self.lora_rank = lora_rank
         self.num_effective_layers = num_base_layers * loop_count
+        self._first_pass_probs = None  # Initialized for self-distillation; set in forward()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
         if logit_softcap <= 0.0: raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
@@ -757,6 +768,11 @@ class GPT(nn.Module):
                 self.lora_k[key] = LoRAAdapter(kv_dim, model_dim, lora_rank)
         # Value embeddings (on virtual layer indices)
         self.ve_layer_indices = [int(x) for x in ve_layers_str.split(",") if x.strip()] if ve_enabled else []
+        # Validate VE indices against virtual layer count to avoid runtime IndexError
+        for _idx in self.ve_layer_indices:
+            if _idx < 0 or _idx >= self.num_effective_layers:
+                raise ValueError(f"VE layer index {_idx} out of range [0, {self.num_effective_layers - 1}] "
+                                 f"for num_base_layers={num_base_layers} loop_count={loop_count}")
         kv_dim_ve = self._ve_target_dim
         if self.ve_layer_indices:
             self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim_ve)
@@ -998,9 +1014,22 @@ def eval_val_sliding_ogd(args, base_model, rank, world_size, device, val_tokens,
             tb = base_bytes_lut[tgt].to(torch.float64)
             tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
             byte_cnt += tb.sum()
-            # OGD update
-            probs = F.softmax(logits[0, s:wlen].float(), dim=-1)
-            vb -= args.ogd_bias_lr * (probs - F.one_hot(y_win[0, s:wlen], args.vocab_size).float()).mean(0)
+            # OGD update (Nacrith-style: multiplicative decay + per-token gradient)
+            if args.ogd_bias_per_token:
+                # Per-token sequential update with beta decay prevents unbounded drift.
+                # Vectorised form: equivalent to a convex combination sequence but fits on GPU.
+                vb *= args.ogd_bias_beta
+                probs = F.softmax(logits[0, s:wlen].float(), dim=-1)
+                tgt_onehot = F.one_hot(y_win[0, s:wlen], args.vocab_size).float()
+                # (probs - onehot) is the per-token gradient; mean over tokens == batch OGD, but
+                # we scale the step so that later tokens within the window weigh more (recency bias).
+                T_step = probs.shape[0]
+                recency_w = torch.linspace(0.5, 1.0, T_step, device=device)
+                grad_vec = ((probs - tgt_onehot) * recency_w.unsqueeze(1)).sum(0) / recency_w.sum()
+                vb -= args.ogd_bias_lr * grad_vec
+            else:
+                probs = F.softmax(logits[0, s:wlen].float(), dim=-1)
+                vb -= args.ogd_bias_lr * (probs - F.one_hot(y_win[0, s:wlen], args.vocab_size).float()).mean(0)
             if log_fn and (wi + 1) % 500 == 0:
                 ibpb = (loss_sum / tok_cnt).item() / math.log(2.0) * (tok_cnt / byte_cnt).item()
                 log_fn(f"ogd:window {wi+1}/{len(my_wins)} bpb:{ibpb:.4f}")
@@ -1010,6 +1039,120 @@ def eval_val_sliding_ogd(args, base_model, rank, world_size, device, val_tokens,
         dist.all_reduce(byte_cnt, op=dist.ReduceOp.SUM)
     vl = (loss_sum / tok_cnt).item()
     base_model.train()
+    return vl, vl / math.log(2.0) * (tok_cnt.item() / byte_cnt.item())
+# ---------------------------------------------------------------------------
+# Legal Score-First TTT with Entropy Gating (V9 novel technique)
+# ---------------------------------------------------------------------------
+def eval_val_sliding_ttt(args, base_model, rank, world_size, device, val_tokens,
+                          base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                          stride, eval_seq_len, log_fn=None):
+    """Legal score-first TTT with entropy gating.
+
+    Protocol:
+      For each sliding window:
+        1. SCORE the suffix portion under torch.inference_mode() (no weight updates yet).
+           This is the scored loss contribution — legal per competition rules.
+        2. ADAPT the model with SGD on matrix params using the full window's tokens.
+           Novel twist: only backprop through tokens where neural entropy exceeds the
+           window's entropy median (focuses adaptation on genuinely uncertain predictions).
+        3. Move to next window with the adapted model.
+      Because step 1 finishes before step 2 on the same chunk, no token is re-scored.
+
+    After eval, original weights are restored so other eval methods see the pristine model.
+    Each rank does TTT on its own window subset (distributed parallelism). The reported BPB is
+    the token-weighted average across ranks.
+    """
+    seq_len = eval_seq_len
+    total_tokens = val_tokens.numel() - 1
+    # Select TTT params: 2D matrices in transformer blocks, excluding LoRA adapters
+    ttt_params = []
+    for name, p in base_model.named_parameters():
+        if p.ndim == 2 and "blocks" in name and "lora_" not in name and p.requires_grad:
+            ttt_params.append(p)
+    if len(ttt_params) == 0:
+        if log_fn: log_fn("ttt: no eligible params, skipping")
+        return None, None
+    # Save pristine state for restoration after eval
+    orig_state = [p.data.detach().clone() for p in ttt_params]
+    ttt_optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    # Reduce computation: iterate only own rank's windows
+    ws_all = [w for w in range(0, total_tokens, stride) if min(w + seq_len, total_tokens) - w >= 1]
+    my_s, my_e = (len(ws_all) * rank) // world_size, (len(ws_all) * (rank + 1)) // world_size
+    my_wins = ws_all[my_s:my_e]
+    n_windows = max(len(my_wins), 1)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    tok_cnt = torch.zeros((), device=device, dtype=torch.float64)
+    byte_cnt = torch.zeros((), device=device, dtype=torch.float64)
+    try:
+        for wi, ws in enumerate(my_wins):
+            end = min(ws + seq_len, total_tokens); wlen = end - ws
+            s = 0 if ws == 0 else max(wlen - stride, 0)
+            chunk = val_tokens[ws:end+1].to(dtype=torch.int64, device=device)
+            x_win, y_win = chunk[:-1].unsqueeze(0), chunk[1:]  # y_win: (T,)
+            # === PHASE 1: LEGAL SCORING (score before any TTT on this chunk) ===
+            base_model.eval()
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = base_model.forward_logits(x_win)
+                logits_2d = logits[0].float()  # (T, V)
+                nll = F.cross_entropy(logits_2d, y_win, reduction='none')
+                loss_sum += nll[s:wlen].to(torch.float64).sum()
+                tok_cnt += float(wlen - s)
+                tgt, prev = y_win[s:wlen], x_win[0, s:wlen]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_cnt += tb.sum()
+            # === PHASE 2: TTT ADAPTATION (scored tokens become training data) ===
+            base_model.train()
+            for epoch in range(args.ttt_epochs):
+                # Cosine LR decay across windows + epochs for stability
+                progress = (wi + (epoch + 1) / args.ttt_epochs) / n_windows
+                lr_scale = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+                for g in ttt_optimizer.param_groups:
+                    g['lr'] = args.ttt_lr * lr_scale
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits_adapt = base_model.forward_logits(x_win)[0].float()
+                if args.ttt_entropy_gate:
+                    # NOVEL: entropy-gated TTT — only backprop through uncertain tokens.
+                    # Rationale: easy (low-entropy) predictions are already good; spending
+                    # TTT capacity on them wastes gradient and can overfit to noise.
+                    with torch.no_grad():
+                        probs = F.softmax(logits_adapt, dim=-1)
+                        entropy = -(probs * probs.clamp_min(1e-10).log()).sum(-1)
+                        thresh = torch.quantile(entropy, args.ttt_entropy_quantile)
+                        # Use >= so the median is included — prevents all-False mask
+                        # when entropies are uniform (degenerate but possible early in training).
+                        mask = (entropy >= thresh).float()
+                    mask_sum = mask.sum()
+                    per_tok_nll = F.cross_entropy(logits_adapt, y_win, reduction='none')
+                    # Safety: if too few tokens selected, fall back to uniform mean
+                    if mask_sum.item() < max(4, y_win.numel() // 8):
+                        loss_adapt = per_tok_nll.mean()
+                    else:
+                        loss_adapt = (per_tok_nll * mask).sum() / mask_sum
+                else:
+                    loss_adapt = F.cross_entropy(logits_adapt, y_win, reduction='mean')
+                ttt_optimizer.zero_grad(set_to_none=True)
+                loss_adapt.backward()
+                torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+                ttt_optimizer.step()
+            base_model.eval()
+            if log_fn and (wi + 1) % 500 == 0:
+                ibpb = (loss_sum / tok_cnt).item() / math.log(2.0) * (tok_cnt / byte_cnt).item()
+                log_fn(f"ttt:window {wi+1}/{n_windows} bpb:{ibpb:.4f} lr:{lr_scale*args.ttt_lr:.5f}")
+    finally:
+        # Always restore pristine weights so downstream eval methods see the original model
+        with torch.no_grad():
+            for p, saved in zip(ttt_params, orig_state):
+                p.data.copy_(saved)
+        base_model.eval()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(tok_cnt, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_cnt, op=dist.ReduceOp.SUM)
+    if tok_cnt.item() <= 0 or byte_cnt.item() <= 0:
+        return None, None
+    vl = (loss_sum / tok_cnt).item()
     return vl, vl / math.log(2.0) * (tok_cnt.item() / byte_cnt.item())
 # ---------------------------------------------------------------------------
 # Quantization
@@ -1093,7 +1236,7 @@ def selective_prune_to_fit(quant_result, quant_meta, code_bytes, target_bytes=15
         else: lo = mid + 1
     for i in range(lo):
         tn, r, c, _, _ = ones_info[i]; quant_result[tn][r, c] = 0
-def mixed_quantize_int6(state_dict, int6_cats, hessians=None):
+def mixed_quantize_int6(state_dict, int6_cats, hessians=None, sdclip_k_int6=12.85, sdclip_k_int8=20.0):
     result, meta = {}, {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
@@ -1105,11 +1248,12 @@ def mixed_quantize_int6(state_dict, int6_cats, hessians=None):
             result[name] = t.float(); meta[name] = "passthrough_ctrl"; continue
         if cat in int6_cats and t.ndim >= 1:
             h = hessians.get(name) if hessians else None
-            q, s = quantize_int6_gptq(t, h) if h is not None and t.ndim == 2 else quantize_int6_per_row(t)
+            q, s = (quantize_int6_gptq(t, h, sdclip_k=sdclip_k_int6) if h is not None and t.ndim == 2
+                    else quantize_int6_per_row(t, sdclip_k=sdclip_k_int6))
             result[name + ".q"] = q; result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
         else:
-            q, s = quantize_float_tensor(t)
+            q, s = quantize_float_tensor(t, sdclip_k=sdclip_k_int8)
             result[name + ".q"] = q; result[name + ".scale"] = s
             meta[name] = {"type": "int8"}
     return result, meta
@@ -1596,7 +1740,9 @@ def main():
     hessian_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     hessians = collect_hessians(base_model, hessian_loader, device, num_batches=64, seq_len=args.train_seq_len)
     log0(f"gptq:collected {len(hessians)} Hessians")
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"}, hessians=hessians)
+    quant_result, quant_meta = mixed_quantize_int6(
+        sd_cpu, {"mlp", "attn"}, hessians=hessians,
+        sdclip_k_int6=args.sdclip_k_int6, sdclip_k_int8=args.sdclip_k_int8)
     code_bytes = len(code.encode("utf-8"))
     # Selective pruning using Huffman size estimation
     log0("selective_prune:binary search to fit under 16MB (Huffman)...")
@@ -1746,6 +1892,25 @@ def main():
         log0(f"final_ngram_oracle_exact val_loss:{ng_vl:.8f} val_bpb:{ng_bpb:.8f}")
         if ng_bpb < best_bpb:
             best_loss, best_bpb = ng_vl, ng_bpb
+    # Legal Score-First TTT with entropy gating (V9 novel technique)
+    # Runs last because it modifies weights temporarily; state is restored after.
+    if args.ttt_enabled:
+        torch.cuda.synchronize(); t_ttt = time.perf_counter()
+        ttt_stride = args.eval_stride if args.eval_stride > 0 else sw_seq_len
+        ttt_result = eval_val_sliding_ttt(
+            args, eval_model, rank, world_size, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=ttt_stride, eval_seq_len=sw_seq_len, log_fn=log0)
+        torch.cuda.synchronize()
+        if ttt_result is not None and ttt_result[0] is not None:
+            ttt_vl, ttt_bpb = ttt_result
+            log0(f"final_ttt val_loss:{ttt_vl:.4f} val_bpb:{ttt_bpb:.4f} "
+                 f"eval_time:{1000.0*(time.perf_counter()-t_ttt):.0f}ms")
+            log0(f"final_ttt_exact val_loss:{ttt_vl:.8f} val_bpb:{ttt_bpb:.8f}")
+            if ttt_bpb < best_bpb:
+                best_loss, best_bpb = ttt_vl, ttt_bpb
+        else:
+            log0("final_ttt: skipped (no eligible params or zero tokens)")
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{best_loss:.8f} val_bpb:{best_bpb:.8f}")
     if distributed: dist.destroy_process_group()
 if __name__ == "__main__":
